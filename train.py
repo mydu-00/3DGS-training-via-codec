@@ -40,7 +40,27 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+def _quant_dequant_int8_inplace(param: torch.nn.Parameter):
+    """Apply symmetric int8 quantize-dequantize to a parameter tensor in-place."""
+    with torch.no_grad():
+        max_abs = param.data.abs().max()
+        if max_abs <= 0:
+            return
+        scale = max_abs / 127.0
+        q = torch.clamp(torch.round(param.data / scale), -127, 127).to(torch.int8)
+        param.data.copy_(q.to(param.data.dtype) * scale)
+
+
+def _apply_sh_int8_quantization(gaussians: GaussianModel, mode: str):
+    if mode == "none":
+        return
+    if mode in ("all", "dc"):
+        _quant_dequant_int8_inplace(gaussians._features_dc)
+    if mode in ("all", "rest"):
+        _quant_dequant_int8_inplace(gaussians._features_rest)
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_int8_quantization):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -180,9 +200,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
+                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization)
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
                     gaussians.optimizer.step()
+                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization)
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
@@ -265,6 +287,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
+    parser.add_argument('--sh_int8_quantization', type=str, choices=["none", "dc", "rest", "all"], default="none")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
@@ -279,7 +302,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_int8_quantization)
 
     # All done
     print("\nTraining complete.")
