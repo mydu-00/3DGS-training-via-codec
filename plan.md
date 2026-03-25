@@ -1,12 +1,10 @@
 ## Plan: Legacy Server + Agent Workflow
 
-在不升级课题组服务器系统（Ubuntu 18.04, 无 sudo）的前提下，采用“本地新版 VS Code + Copilot Agent（主控）+ 远程 SSH 执行（算力）”双端工作流，先保证今天可用，再尝试恢复 Remote-SSH 完整体验（通过官方 old-linux sysroot workaround）。
+在不升级课题组服务器系统（Ubuntu 18.04, 无 sudo 权限）的前提下，采用“本地新版 VS Code + Copilot Agent（主控）+ 远程 SSH 执行（算力）”双端工作流，先保证今天可用，再尝试恢复 Remote-SSH 完整体验（通过官方 old-linux sysroot workaround）。
 
 **Direction**
 1. 服务器信息：
-   - 服务器地址：10.210.3.133
-   - 用户名：qianjunhong
-   - 密码：Qwer123456
+
 2. 要求：
    - 不要动里面的文件，重新从github下一个高斯的工程（inria）
    - 环境配好了，直接用gs那个环境,micromamba activate gs
@@ -15,6 +13,51 @@
     3.1. 先跑一版3dgs原版的base，记录SSIM,PSNR,LPIPS这三个指标。
     3.2. 在训练阶段，每一次迭代，backward 3DGS参数更新后，存回global memory之前，将3dgs的颜色球谐函数sh部分参数量化成int8，然后再反量化回float32，这两组都循环30k次，记录SSIM,PSNR,LPIPS这三个指标，看一下掉了多少。
     3.4. 训练设置，python train.py -s xx/tandt/truck --eval
+4. 使用方式（登录服务器后可直接复制）
+   ```bash
+   # 0) 登录
+   ssh qianjunhong@10.210.3.133
+   # 首次连接输入 yes 接受主机指纹
+
+   # 1) 可选：固定到 tmux 会话，避免断连中断训练
+   tmux new -As gs
+
+   # 2) 进入用户目录并准备工作区（新目录，避免覆盖）
+   cd ~
+   mkdir -p work && cd work
+
+   # 3) Bootstrap 仓库（优先 SSH，若没配 key 用 HTTPS）
+   git clone --recursive git@github.com:mydu-00/3DGS-training-via-codec.git 3dgs_codec_exp
+   # git clone --recursive https://github.com/mydu-00/3DGS-training-via-codec.git 3dgs_codec_exp
+   cd 3dgs_codec_exp
+   git submodule sync --recursive
+   git submodule update --init --recursive
+
+   # 4) 激活已存在环境（按要求使用 gs）
+   eval "$(micromamba shell hook --shell bash)"
+   micromamba activate gs
+
+   # 5) 数据集准备（若服务器还没有 Tanks&Temples truck）
+   mkdir -p ~/datasets && cd ~/datasets
+   wget -O tandt_db.zip https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
+   unzip -o tandt_db.zip
+   # 预期 truck 路径类似：~/datasets/tandt/truck
+
+   # 6) 回到工程目录，先做短跑验证（200 iter）
+   cd ~/work/3dgs_codec_exp
+   bash scripts/run_debug.sh ~/datasets/tandt/truck 200
+
+   # 7) 正式实验：三组 30k（base/qrest/qall）+ 自动汇总 SSIM/PSNR/LPIPS
+   bash scripts/run_suite.sh ~/datasets/tandt/truck truck 30000
+
+   # 8) 查看结果
+   ls -lah artifacts
+   cat artifacts/summary_truck.csv
+
+   # 9) 后续每次本地 push 新代码后，远程更新并复跑
+   git pull --rebase
+   bash scripts/run_debug.sh ~/datasets/tandt/truck 200
+   ```
 
 **Steps**
 1. Phase 1 - 先验证硬约束与最小可用链路
@@ -81,4 +124,4 @@
 **与CI/CD的关系**
 1. CI/CD 偏“自动化发布与持续集成”，通常由 GitHub Actions 等在云端触发。
 2. 你当前最需要的是“研究型开发循环”：人主导目标，Agent 辅助改代码，远程 GPU 主导执行验证。
-3. 之后可增量加一个轻量 CI：只跑 lint/单测/格式检查，不跑完整 GPU 训练。
+3. 之后可增量加一个轻量 CI
