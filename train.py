@@ -50,13 +50,21 @@ def _qdq_tensor(x: torch.Tensor) -> torch.Tensor:
 
 
 def _qdq_channel(x: torch.Tensor) -> torch.Tensor:
-    """Per-channel symmetric int8 QDQ.
+    """Per-gaussian per-channel symmetric int8 QDQ.
 
-    Computes one scale per (k, c) position shared across the N (gaussian) dimension.
-    For _features_rest [N, K, 3]: K*3 = 45 scales (SH degree 3).
-    For _features_dc  [N, 1, 3]:  1*3 = 3 scales.
+    Computes one scale per Gaussian per colour channel (C dimension), reducing
+    over the SH-order dimension (dim=1).  Each Gaussian gets its own set of C
+    scales – scales are NOT shared across the N (Gaussian) dimension.
+
+    For _features_rest [N, K, 3]: N*3 scales (one per Gaussian per RGB channel).
+    For _features_dc  [N, 1, 3]:  N*3 scales (one per Gaussian per RGB channel).
+
+    Note: the previous implementation reduced over dim=0, yielding K*3 = 45
+    global scales shared across all Gaussians, which was unintentional (bug).
+    The corrected implementation reduces over the SH-order dim (dim=1), so each
+    Gaussian has its own independent scale per colour channel.
     """
-    max_abs = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12)
+    max_abs = x.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
     scale = max_abs / 127.0
     q = torch.clamp(torch.round(x / scale), -127, 127).to(torch.int8)
     return q.to(x.dtype) * scale
@@ -106,9 +114,12 @@ def _quant_dequant_int8_inplace(
     Args:
         param:       The parameter to quantize (modified in-place).
         granularity: ``'tensor'`` – one global scale (original behaviour);
-                     ``'channel'`` – one scale per (SH-order, colour) position;
+                     ``'channel'`` – one scale per Gaussian per colour channel
+                                    (N*3 scales for rest and dc); each Gaussian
+                                    has its own independent scales, NOT shared
+                                    across the N dimension;
                      ``'group'``   – one scale per block of *group_size* flat
-                                    channel elements.
+                                    channel elements (already per-Gaussian).
         group_size:  Block size for ``'group'`` mode.  Ignored otherwise.
     """
     with torch.no_grad():
@@ -136,7 +147,8 @@ def _apply_sh_int8_quantization(
         mode:        Which SH components to quantize: ``'none'``, ``'dc'``,
                      ``'rest'``, or ``'all'``.
         granularity: Quantization granularity (``'tensor'`` / ``'channel'`` /
-                     ``'group'``).  See :func:`_quant_dequant_int8_inplace`.
+                     ``'group'``).  ``'channel'`` is per-gaussian per-colour-
+                     channel (bug-fixed).  See :func:`_quant_dequant_int8_inplace`.
         group_size:  Group size for ``'group'`` granularity.
     """
     if mode == "none":
