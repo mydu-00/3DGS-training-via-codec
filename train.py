@@ -41,26 +41,112 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-def _quant_dequant_int8_inplace(param: torch.nn.Parameter):
-    """Apply symmetric int8 quantize-dequantize to a parameter tensor in-place."""
+def _qdq_tensor(x: torch.Tensor) -> torch.Tensor:
+    """Per-tensor (global) symmetric int8 QDQ. One scale for the entire tensor."""
+    max_abs = x.abs().max().clamp(min=1e-12)
+    scale = max_abs / 127.0
+    q = torch.clamp(torch.round(x / scale), -127, 127).to(torch.int8)
+    return q.to(x.dtype) * scale
+
+
+def _qdq_channel(x: torch.Tensor) -> torch.Tensor:
+    """Per-channel symmetric int8 QDQ.
+
+    Computes one scale per (k, c) position shared across the N (gaussian) dimension.
+    For _features_rest [N, K, 3]: K*3 = 45 scales (SH degree 3).
+    For _features_dc  [N, 1, 3]:  1*3 = 3 scales.
+    """
+    max_abs = x.abs().amax(dim=0, keepdim=True).clamp(min=1e-12)
+    scale = max_abs / 127.0
+    q = torch.clamp(torch.round(x / scale), -127, 127).to(torch.int8)
+    return q.to(x.dtype) * scale
+
+
+def _qdq_group(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Per-group symmetric int8 QDQ.
+
+    Flattens dims 1+ into a single channel dimension of size flat_C, then groups
+    into chunks of group_size, each with its own scale.
+
+    For _features_rest [N, 15, 3] -> flat_C = 45.  Practical group sizes that
+    divide 45: 1, 3, 5, 9, 15, 45.  Default 15 yields 3 groups (one per RGB
+    channel across all SH orders); 9 yields 5 groups; 5 yields 9 groups.
+
+    For _features_dc [N, 1, 3] -> flat_C = 3.  Divisors of 3: 1, 3.  If the
+    requested group_size does not divide flat_C, the largest divisor that does is
+    used automatically (fallback guarantee).
+    """
+    orig_shape = x.shape
+    N = x.shape[0]
+    flat = x.reshape(N, -1)      # [N, flat_C]
+    flat_C = flat.shape[1]
+
+    # Find effective group size: largest divisor of flat_C that is <= group_size.
+    gs = group_size
+    if flat_C % gs != 0:
+        # Collect all divisors of flat_C up to group_size, pick the largest.
+        divisors = [d for d in range(1, min(gs, flat_C) + 1) if flat_C % d == 0]
+        gs = divisors[-1]  # divisors is always non-empty (1 always divides flat_C)
+
+    G = flat_C // gs
+    grouped = flat.reshape(N, G, gs)                                   # [N, G, gs]
+    max_abs = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)  # [N, G, 1]
+    scale = max_abs / 127.0
+    q = torch.clamp(torch.round(grouped / scale), -127, 127).to(torch.int8)
+    return (q.to(x.dtype) * scale).reshape(orig_shape)
+
+
+def _quant_dequant_int8_inplace(
+    param: torch.nn.Parameter,
+    granularity: str = "tensor",
+    group_size: int = 15,
+) -> None:
+    """Apply symmetric int8 QDQ to a parameter tensor in-place.
+
+    Args:
+        param:       The parameter to quantize (modified in-place).
+        granularity: ``'tensor'`` – one global scale (original behaviour);
+                     ``'channel'`` – one scale per (SH-order, colour) position;
+                     ``'group'``   – one scale per block of *group_size* flat
+                                    channel elements.
+        group_size:  Block size for ``'group'`` mode.  Ignored otherwise.
+    """
     with torch.no_grad():
-        max_abs = param.data.abs().max()
-        if max_abs <= 0:
+        if param.data.abs().max() <= 0:
             return
-        scale = max_abs / 127.0
-        q = torch.clamp(torch.round(param.data / scale), -127, 127).to(torch.int8)
-        param.data.copy_(q.to(param.data.dtype) * scale)
+        x = param.data
+        if granularity == "channel":
+            param.data.copy_(_qdq_channel(x))
+        elif granularity == "group":
+            param.data.copy_(_qdq_group(x, group_size))
+        else:  # "tensor" – default, backward-compatible
+            param.data.copy_(_qdq_tensor(x))
 
 
-def _apply_sh_int8_quantization(gaussians: GaussianModel, mode: str):
+def _apply_sh_int8_quantization(
+    gaussians: GaussianModel,
+    mode: str,
+    granularity: str = "tensor",
+    group_size: int = 15,
+) -> None:
+    """Apply SH int8 quantization to the Gaussian model.
+
+    Args:
+        gaussians:   The Gaussian model whose SH features are quantized.
+        mode:        Which SH components to quantize: ``'none'``, ``'dc'``,
+                     ``'rest'``, or ``'all'``.
+        granularity: Quantization granularity (``'tensor'`` / ``'channel'`` /
+                     ``'group'``).  See :func:`_quant_dequant_int8_inplace`.
+        group_size:  Group size for ``'group'`` granularity.
+    """
     if mode == "none":
         return
     if mode in ("all", "dc"):
-        _quant_dequant_int8_inplace(gaussians._features_dc)
+        _quant_dequant_int8_inplace(gaussians._features_dc, granularity, group_size)
     if mode in ("all", "rest"):
-        _quant_dequant_int8_inplace(gaussians._features_rest)
+        _quant_dequant_int8_inplace(gaussians._features_rest, granularity, group_size)
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_int8_quantization):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_int8_quantization, *, quant_granularity="tensor", quant_group_size=15):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -200,11 +286,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
-                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization)
+                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization, quant_granularity, quant_group_size)
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
                     gaussians.optimizer.step()
-                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization)
+                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization, quant_granularity, quant_group_size)
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
@@ -288,6 +374,28 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument('--sh_int8_quantization', type=str, choices=["none", "dc", "rest", "all"], default="none")
+    parser.add_argument(
+        '--quant_granularity', type=str,
+        choices=["tensor", "channel", "group"], default="tensor",
+        help=(
+            "SH int8 quantization granularity. "
+            "'tensor': one global scale per tensor (original behaviour, default). "
+            "'channel': one scale per (SH-order, colour) position across all Gaussians "
+            "(45 scales for rest, 3 for dc). "
+            "'group': one scale per block of --quant_group_size flat-channel elements "
+            "(e.g. group_size=15 gives 3 groups for rest's 45 dims)."
+        ),
+    )
+    parser.add_argument(
+        '--quant_group_size', type=int, default=15,
+        help=(
+            "Group size for --quant_granularity=group. "
+            "Must ideally divide the flat channel count (45 for SH-rest, 3 for dc). "
+            "Divisors of 45: 1, 3, 5, 9, 15, 45. "
+            "If not a divisor, the largest divisor <= this value is used automatically. "
+            "Default 15 gives 3 groups (one per RGB channel across all SH orders)."
+        ),
+    )
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
@@ -302,7 +410,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_int8_quantization)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_int8_quantization, quant_granularity=args.quant_granularity, quant_group_size=args.quant_group_size)
 
     # All done
     print("\nTraining complete.")
