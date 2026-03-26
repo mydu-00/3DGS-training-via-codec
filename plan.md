@@ -26,20 +26,49 @@
 
    **注意**: DC分量和其他高频分量在数量和特性上差异较大，建议分开量化以获得更好的效果。
 
-   **4.2 量化粒度 (--quant_granularity)**
-   - `tensor`: 全局量化，整个tensor共享一个scale（最粗粒度）
-   - `channel`: 每个(SH-order, 颜色)位置一个scale（对SH-rest有45个scale，DC有3个）
-   - `group`: 将通道分组，每组共享一个scale
-     - 通过`--quant_group_size`控制组大小（默认15）
-     - SH-rest的45个通道可以按1,3,5,9,15,45分组
-   - `gaussian_group`: 将高斯球分组，每组高斯共享一个scale（空间分组）
-     - 通过`--quant_gaussian_group_size`控制组大小（默认256）
-     - 适合将空间上接近的高斯球分组量化
-     - 常用值: 128, 256, 512, 1024
+   **4.2 量化粒度 (--quant_granularity) - 已优化**
 
-   **4.3 实验建议**
-   - 先尝试channel和group方式（channel-wise grouping）
-   - 后续可以尝试gaussian_group（spatial grouping），比如256个高斯球为一组
+   ⚠️ **重要更新**: `group` 粒度已修正为全局共享scale，现在与`channel`粒度可对照比较。
+
+   - `tensor`: 全局量化，整个tensor共享一个scale（最粗粒度）
+     * 对SH-rest: 1个scale，对DC: 1个scale
+
+   - `channel`: 每个(SH-order, 颜色)位置一个scale（全局共享，跨所有高斯球）
+     * 对SH-rest: 45个scale，对DC: 3个scale
+     * 每个通道在所有高斯球间共享一个scale
+
+   - `group`: 将通道分组，每组共享一个scale（全局共享，跨所有高斯球）✅ **已修正**
+     * 通过`--quant_group_size`控制组大小（默认15）
+     * SH-rest的45个通道可以按1,3,5,9,15,45分组
+     * 例如group_size=15时，有3个scale（45÷15=3）
+     * **现在与channel保持一致性：scales在所有高斯球间共享**
+
+   - `gaussian_group`: 将高斯球分组，每组高斯共享一个scale（空间分组，跨所有通道）
+     * 通过`--quant_gaussian_group_size`控制组大小（默认256）
+     * 每组256个高斯球共享1个scale，用于所有45个通道
+     * 适合将空间上接近的高斯球分组量化
+
+   - `gaussian_group_channel`: 高斯球分组 + 每组内per-channel量化 ✨ **新增**
+     * 每组256个高斯球，组内有45个scale（每通道一个）
+     * 比gaussian_group更细粒度，但保持空间分组结构
+     * 平衡空间局部性和通道精度
+
+   - `gaussian_group_group`: 高斯球分组 + 每组内channel-group量化 ✨ **新增**
+     * 每组256个高斯球，组内按通道分组（如15一组）
+     * 例如256个高斯×3个通道组 = 每个高斯组有3个scale
+     * 介于gaussian_group和gaussian_group_channel之间
+
+   **4.3 高斯球分组粒度建议**
+
+   考虑计算负荷和并行度，推荐的高斯球组大小：
+   - `128`: 更细粒度，更多scale，适合高精度需求
+   - `256`: **推荐默认值**，在精度和计算效率间平衡
+   - `512`: 更粗粒度，更少scale，适合快速实验
+
+   **4.4 实验建议**
+   - ✅ 先比较tensor、channel、group（现已对照）
+   - ✅ 尝试不同高斯球分组粒度（128/256/512）
+   - ✅ 对比gaussian_group的三个变体（基础/channel/group）
    - DC和高频分量建议分开处理（使用dc/rest模式而非all）
 
 5. **使用方式（登录服务器后可直接复制）**
@@ -169,20 +198,46 @@
    bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g15 rest 30000 group 15
 
    # === 高斯球分组实验 (Gaussian grouping, 空间分组) ===
-   # 高频分组（不同高斯球组大小）
+   # 基础gaussian_group（不同高斯球组大小）
    bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg128 rest 30000 gaussian_group 15 128
    bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg256 rest 30000 gaussian_group 15 256
    bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg512 rest 30000 gaussian_group 15 512
 
-   # === 实验性配置（已注释，需要时取消注释） ===
-   # 更细粒度的高斯球分组
-   # bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg64 rest 30000 gaussian_group 15 64
+   # gaussian_group_channel（组内per-channel）✨ 新增
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ggch128 all 30000 gaussian_group_channel 15 128
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ggch256 all 30000 gaussian_group_channel 15 256
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ggch512 all 30000 gaussian_group_channel 15 512
 
-   # DC和高频都使用gaussian_group
-   # bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_gg256 all 30000 gaussian_group 15 256
+   # gaussian_group_group（组内channel-group）✨ 新增
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ggg256_g15 all 30000 gaussian_group_group 15 256
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ggg256_g9 all 30000 gaussian_group_group 9 256
    ```
 
-   **5.5 评估单个模型**
+   **5.5 增量实验脚本 (run_incremental.sh) ✨ 新增**
+
+   为了避免重新运行所有20个实验，提供增量实验脚本，仅运行修正和新增的配置：
+
+   ```bash
+   # 运行增量实验（8组，共16步）
+   bash scripts/run_incremental.sh ~/datasets/tandt/truck truck 30000
+   ```
+
+   **增量实验包含：**
+   1. **修正的group实验**（现在使用全局scale）
+      - `qrest_g3_v2`: 高频SH + group=3 (修正版)
+      - `qrest_g9_v2`: 高频SH + group=9 (修正版)
+
+   2. **新增的gaussian_group变体**
+      - `qall_ggch256`: gaussian_group_channel, 256个高斯，组内45个scale
+      - `qall_ggg256_g15`: gaussian_group_group, 256个高斯，组内3个channel-group scale
+
+   3. **不同高斯球组大小对比**
+      - `qall_gg128/256/512`: 基础gaussian_group
+      - `qall_ggch128/256/512`: gaussian_group_channel
+
+   **输出：** `artifacts/summary_incremental_truck.csv`
+
+   **5.6 评估单个模型**
    ```bash
    # 训练完成后评估
    bash scripts/run_eval.sh truck_base
@@ -193,7 +248,7 @@
    cat artifacts/results_truck_qrest_ch.json
    ```
 
-   **5.6 完整实验套件说明 (run_suite.sh)**
+   **5.7 完整实验套件说明 (run_suite.sh)**
 
    `run_suite.sh` 脚本自动运行完整的量化实验对比套件，包含10组实验配置：
 

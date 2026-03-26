@@ -5,9 +5,10 @@ if [ $# -lt 1 ]; then
   echo "Usage: $0 <scene_path> [iters] [quant_mode] [quant_granularity] [quant_group_size] [quant_gaussian_group_size]"
   echo "  iters:                     training iterations (default: 200)"
   echo "  quant_mode:                none|dc|rest|all   (default: none)"
-  echo "  quant_granularity:         tensor|channel|group|gaussian_group (default: tensor)"
-  echo "  quant_group_size:          group size for 'group' granularity (default: 15)"
-  echo "  quant_gaussian_group_size: group size for 'gaussian_group' granularity (default: 256)"
+  echo "  quant_granularity:         tensor|channel|group|gaussian_group|gaussian_group_channel|gaussian_group_group"
+  echo "                             (default: tensor)"
+  echo "  quant_group_size:          group size for 'group' and 'gaussian_group_group' (default: 15)"
+  echo "  quant_gaussian_group_size: gaussian group size (default: 256)"
   exit 1
 fi
 

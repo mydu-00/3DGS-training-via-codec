@@ -63,10 +63,10 @@ def _qdq_channel(x: torch.Tensor) -> torch.Tensor:
 
 
 def _qdq_group(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Per-group symmetric int8 QDQ (channel-wise grouping).
+    """Per-group symmetric int8 QDQ (channel-wise grouping with global scales).
 
     Flattens dims 1+ into a single channel dimension of size flat_C, then groups
-    into chunks of group_size, each with its own scale.
+    into chunks of group_size. Each group has ONE scale shared across ALL gaussians.
 
     For _features_rest [N, 15, 3] -> flat_C = 45.  Practical group sizes that
     divide 45: 1, 3, 5, 9, 15, 45.  Default 15 yields 3 groups (one per RGB
@@ -75,6 +75,9 @@ def _qdq_group(x: torch.Tensor, group_size: int) -> torch.Tensor:
     For _features_dc [N, 1, 3] -> flat_C = 3.  Divisors of 3: 1, 3.  If the
     requested group_size does not divide flat_C, the largest divisor that does is
     used automatically (fallback guarantee).
+
+    This is now consistent with channel granularity: scales are shared across
+    the gaussian (dim 0) dimension.
     """
     orig_shape = x.shape
     N = x.shape[0]
@@ -90,7 +93,9 @@ def _qdq_group(x: torch.Tensor, group_size: int) -> torch.Tensor:
 
     G = flat_C // gs
     grouped = flat.reshape(N, G, gs)                                   # [N, G, gs]
-    max_abs = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)  # [N, G, 1]
+    # Compute max across both gaussians (dim 0) and group elements (dim 2)
+    # This gives G scales total, shared across all N gaussians
+    max_abs = grouped.abs().amax(dim=(0, 2), keepdim=True).clamp(min=1e-12)  # [1, G, 1]
     scale = max_abs / 127.0
     q = torch.clamp(torch.round(grouped / scale), -127, 127).to(torch.int8)
     return (q.to(x.dtype) * scale).reshape(orig_shape)
@@ -146,6 +151,99 @@ def _qdq_gaussian_group(x: torch.Tensor, gaussian_group_size: int) -> torch.Tens
     return (q.to(x.dtype) * scale).reshape(orig_shape)
 
 
+def _qdq_gaussian_group_channel(x: torch.Tensor, gaussian_group_size: int) -> torch.Tensor:
+    """Per-gaussian-group with per-channel quantization within each group.
+
+    Groups gaussians into blocks, then within each group, uses per-channel quantization.
+    This is finer-grained than gaussian_group: each group has one scale per channel.
+
+    For _features_rest [N, 15, 3] with gaussian_group_size=256:
+    - Creates N//256 groups, each with 256 gaussians
+    - Each group has 45 scales (one per channel, shared across the 256 gaussians in that group)
+
+    Args:
+        x: Input tensor [N, K, C] where N = num gaussians
+        gaussian_group_size: Number of gaussians per group (e.g., 256)
+
+    Returns:
+        Quantized and dequantized tensor with same shape as input.
+    """
+    orig_shape = x.shape
+    N = x.shape[0]
+
+    # Determine effective group size
+    ggs = min(gaussian_group_size, N)
+    if N % ggs != 0:
+        divisors = [d for d in range(1, min(ggs, N) + 1) if N % d == 0]
+        ggs = divisors[-1]
+
+    G = N // ggs  # Number of groups
+    # Reshape to [G, ggs, K, C] to preserve channel structure
+    grouped = x.reshape(G, ggs, x.shape[1], x.shape[2])
+
+    # Compute scale per group per channel (across the ggs gaussians in each group)
+    # Shape: [G, 1, K, C]
+    max_abs = grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    scale = max_abs / 127.0
+
+    # Quantize and dequantize
+    q = torch.clamp(torch.round(grouped / scale), -127, 127).to(torch.int8)
+    return (q.to(x.dtype) * scale).reshape(orig_shape)
+
+
+def _qdq_gaussian_group_group(x: torch.Tensor, gaussian_group_size: int, channel_group_size: int) -> torch.Tensor:
+    """Per-gaussian-group with per-group channel quantization within each group.
+
+    Groups gaussians into blocks, then within each group, uses channel-group quantization.
+    This provides a middle ground between gaussian_group and gaussian_group_channel.
+
+    For _features_rest [N, 15, 3] with gaussian_group_size=256 and channel_group_size=15:
+    - Creates N//256 groups, each with 256 gaussians
+    - Each group has 3 scales (45 channels / 15 = 3 groups per gaussian group)
+
+    Args:
+        x: Input tensor [N, K, C] where N = num gaussians
+        gaussian_group_size: Number of gaussians per group (e.g., 256)
+        channel_group_size: Channel group size within each gaussian group (e.g., 15)
+
+    Returns:
+        Quantized and dequantized tensor with same shape as input.
+    """
+    orig_shape = x.shape
+    N = x.shape[0]
+
+    # Flatten channel dimensions
+    flat = x.reshape(N, -1)  # [N, flat_C]
+    flat_C = flat.shape[1]
+
+    # Determine effective gaussian group size
+    ggs = min(gaussian_group_size, N)
+    if N % ggs != 0:
+        divisors = [d for d in range(1, min(ggs, N) + 1) if N % d == 0]
+        ggs = divisors[-1]
+
+    # Determine effective channel group size
+    cgs = channel_group_size
+    if flat_C % cgs != 0:
+        divisors = [d for d in range(1, min(cgs, flat_C) + 1) if flat_C % d == 0]
+        cgs = divisors[-1]
+
+    GG = N // ggs  # Number of gaussian groups
+    CG = flat_C // cgs  # Number of channel groups
+
+    # Reshape to [GG, ggs, CG, cgs]
+    grouped = flat.reshape(GG, ggs, CG, cgs)
+
+    # Compute scale per gaussian group per channel group (across ggs gaussians and cgs channels)
+    # Shape: [GG, 1, CG, 1]
+    max_abs = grouped.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+    scale = max_abs / 127.0
+
+    # Quantize and dequantize
+    q = torch.clamp(torch.round(grouped / scale), -127, 127).to(torch.int8)
+    return (q.to(x.dtype) * scale).reshape(orig_shape)
+
+
 def _quant_dequant_int8_inplace(
     param: torch.nn.Parameter,
     granularity: str = "tensor",
@@ -159,11 +257,16 @@ def _quant_dequant_int8_inplace(
         granularity:        ``'tensor'`` – one global scale (original behaviour);
                             ``'channel'`` – one scale per (SH-order, colour) position;
                             ``'group'``   – one scale per block of *group_size* flat
-                                           channel elements;
+                                           channel elements (global across gaussians);
                             ``'gaussian_group'`` – one scale per block of *gaussian_group_size*
-                                                  gaussians (spatial grouping).
-        group_size:         Block size for ``'group'`` mode.  Ignored otherwise.
-        gaussian_group_size: Block size for ``'gaussian_group'`` mode. Ignored otherwise.
+                                                  gaussians (spatial grouping);
+                            ``'gaussian_group_channel'`` – gaussian groups with per-channel
+                                                          quantization within each group;
+                            ``'gaussian_group_group'`` – gaussian groups with channel-group
+                                                        quantization within each group.
+        group_size:         Block size for ``'group'`` and ``'gaussian_group_group'`` modes.
+        gaussian_group_size: Block size for ``'gaussian_group'``, ``'gaussian_group_channel'``,
+                            and ``'gaussian_group_group'`` modes.
     """
     with torch.no_grad():
         if param.data.abs().max() <= 0:
@@ -175,6 +278,10 @@ def _quant_dequant_int8_inplace(
             param.data.copy_(_qdq_group(x, group_size))
         elif granularity == "gaussian_group":
             param.data.copy_(_qdq_gaussian_group(x, gaussian_group_size))
+        elif granularity == "gaussian_group_channel":
+            param.data.copy_(_qdq_gaussian_group_channel(x, gaussian_group_size))
+        elif granularity == "gaussian_group_group":
+            param.data.copy_(_qdq_gaussian_group_group(x, gaussian_group_size, group_size))
         else:  # "tensor" – default, backward-compatible
             param.data.copy_(_qdq_tensor(x))
 
@@ -435,16 +542,21 @@ if __name__ == "__main__":
     parser.add_argument('--sh_int8_quantization', type=str, choices=["none", "dc", "rest", "all"], default="none")
     parser.add_argument(
         '--quant_granularity', type=str,
-        choices=["tensor", "channel", "group", "gaussian_group"], default="tensor",
+        choices=["tensor", "channel", "group", "gaussian_group", "gaussian_group_channel", "gaussian_group_group"],
+        default="tensor",
         help=(
             "SH int8 quantization granularity. "
             "'tensor': one global scale per tensor (original behaviour, default). "
             "'channel': one scale per (SH-order, colour) position across all Gaussians "
             "(45 scales for rest, 3 for dc). "
             "'group': one scale per block of --quant_group_size flat-channel elements "
-            "(e.g. group_size=15 gives 3 groups for rest's 45 dims). "
+            "(global across gaussians, e.g. group_size=15 gives 3 groups for rest's 45 dims). "
             "'gaussian_group': one scale per block of --quant_gaussian_group_size gaussians "
-            "(spatial grouping, e.g. 256 gaussians per group)."
+            "(spatial grouping, e.g. 256 gaussians share one scale for all channels). "
+            "'gaussian_group_channel': gaussian groups with per-channel quantization within each group "
+            "(e.g. 256 gaussians per group, 45 scales per group for rest). "
+            "'gaussian_group_group': gaussian groups with channel-group quantization within each group "
+            "(e.g. 256 gaussians per group, 3 channel-group scales per gaussian group)."
         ),
     )
     parser.add_argument(
@@ -460,11 +572,10 @@ if __name__ == "__main__":
     parser.add_argument(
         '--quant_gaussian_group_size', type=int, default=256,
         help=(
-            "Group size for --quant_granularity=gaussian_group (spatial grouping). "
+            "Group size for gaussian-based granularities (spatial grouping). "
             "Number of gaussians per quantization group. "
-            "Each group of gaussians shares one scale across all their SH coefficients. "
-            "Useful for grouping spatially close gaussians. "
-            "Default 256. Common values: 128, 256, 512, 1024."
+            "Used by: gaussian_group, gaussian_group_channel, gaussian_group_group. "
+            "Default 256. Common values: 128, 256, 512 (balance between granularity and parallelism)."
         ),
     )
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
