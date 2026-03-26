@@ -1,6 +1,6 @@
 ## Plan: Legacy Server + Agent Workflow
 
-在不升级课题组服务器系统（Ubuntu 18.04, 无 sudo 权限）的前提下，采用“本地新版 VS Code + Copilot Agent（主控）+ 远程 SSH 执行（算力）”双端工作流，先保证今天可用，再尝试恢复 Remote-SSH 完整体验（通过官方 old-linux sysroot workaround）。
+在不升级课题组服务器系统（Ubuntu 18.04, 无 sudo 权限）的前提下，采用"本地新版 VS Code + Copilot Agent（主控）+ 远程 SSH 执行（算力）"双端工作流，先保证今天可用，再尝试恢复 Remote-SSH 完整体验（通过官方 old-linux sysroot workaround）。
 
 **Direction**
 1. 服务器信息：
@@ -13,7 +13,38 @@
     3.1. 先跑一版3dgs原版的base，记录SSIM,PSNR,LPIPS这三个指标。
     3.2. 在训练阶段，每一次迭代，backward 3DGS参数更新后，存回global memory之前，将3dgs的颜色球谐函数sh部分参数量化成int8，然后再反量化回float32，这两组都循环30k次，记录SSIM,PSNR,LPIPS这三个指标，看一下掉了多少。
     3.4. 训练设置，python train.py -s xx/tandt/truck --eval
-4. 使用方式（登录服务器后可直接复制）
+
+4. **量化方式说明**
+
+   本项目实现了多种int8量化策略，旨在找到f32->int8量化+反量化影响最小的方法：
+
+   **4.1 量化模式 (--sh_int8_quantization)**
+   - `none`: 不量化（baseline）
+   - `dc`: 仅量化DC分量（低频，数量较少）
+   - `rest`: 仅量化高频分量（数量较多，与DC分量差异显著）
+   - `all`: 同时量化DC和高频分量
+
+   **注意**: DC分量和其他高频分量在数量和特性上差异较大，建议分开量化以获得更好的效果。
+
+   **4.2 量化粒度 (--quant_granularity)**
+   - `tensor`: 全局量化，整个tensor共享一个scale（最粗粒度）
+   - `channel`: 每个(SH-order, 颜色)位置一个scale（对SH-rest有45个scale，DC有3个）
+   - `group`: 将通道分组，每组共享一个scale
+     - 通过`--quant_group_size`控制组大小（默认15）
+     - SH-rest的45个通道可以按1,3,5,9,15,45分组
+   - `gaussian_group`: 将高斯球分组，每组高斯共享一个scale（空间分组）
+     - 通过`--quant_gaussian_group_size`控制组大小（默认256）
+     - 适合将空间上接近的高斯球分组量化
+     - 常用值: 128, 256, 512, 1024
+
+   **4.3 实验建议**
+   - 先尝试channel和group方式（channel-wise grouping）
+   - 后续可以尝试gaussian_group（spatial grouping），比如256个高斯球为一组
+   - DC和高频分量建议分开处理（使用dc/rest模式而非all）
+
+5. **使用方式（登录服务器后可直接复制）**
+
+   **5.1 初次设置（仅第一次需要）**
    ```bash
    # 0) 登录
    ssh qianjunhong@10.210.3.133
@@ -42,21 +73,109 @@
    wget -O tandt_db.zip https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
    unzip -o tandt_db.zip
    # 预期 truck 路径类似：~/datasets/tandt/truck
+   ```
 
-   # 6) 回到工程目录，先做短跑验证（200 iter）
+   **5.2 后续使用（已有代码库，从GitHub更新）**
+   ```bash
+   # 0) 登录服务器
+   ssh qianjunhong@10.210.3.133
+
+   # 1) 进入tmux会话（推荐）
+   tmux attach -t gs
+   # 如果会话不存在: tmux new -As gs
+
+   # 2) 进入工作目录
    cd ~/work/3dgs_codec_exp
+
+   # 3) 激活环境
+   eval "$(micromamba shell hook --shell bash)"
+   micromamba activate gs
+
+   # 4) 同步最新代码（从GitHub拉取）
+   git fetch origin
+   git pull --rebase origin main
+   # 或切换到特定分支: git checkout <branch_name> && git pull --rebase
+
+   # 5) 更新子模块（如有必要）
+   git submodule sync --recursive
+   git submodule update --init --recursive
+   ```
+
+   **5.3 运行实验**
+   ```bash
+   # 进入工作目录（如果还没有）
+   cd ~/work/3dgs_codec_exp
+
+   # A) 快速验证（200次迭代，约几分钟）
    bash scripts/run_debug.sh ~/datasets/tandt/truck 200
 
-   # 7) 正式实验：三组 30k（base/qrest/qall）+ 自动汇总 SSIM/PSNR/LPIPS
+   # B) 单个训练实验示例
+
+   # 示例1: Baseline（无量化）
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_base none 30000
+
+   # 示例2: 仅量化高频分量，使用channel粒度（推荐先试）
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_ch rest 30000 channel
+
+   # 示例3: 仅量化高频分量，使用group粒度（通道分组，组大小9）
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g9 rest 30000 group 9
+
+   # 示例4: 量化高频分量，使用gaussian_group粒度（空间分组，256个高斯球一组）
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg256 rest 30000 gaussian_group 15 256
+
+   # 示例5: 仅量化DC分量，使用channel粒度
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qdc_ch dc 30000 channel
+
+   # 示例6: 全部量化（DC+高频），使用channel粒度
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ch all 30000 channel
+
+   # C) 完整实验套件（baseline + 量化rest + 量化all）
    bash scripts/run_suite.sh ~/datasets/tandt/truck truck 30000
 
-   # 8) 查看结果
+   # D) 查看结果
    ls -lah artifacts
    cat artifacts/summary_truck.csv
+   ```
 
-   # 9) 后续每次本地 push 新代码后，远程更新并复跑
-   git pull --rebase
-   bash scripts/run_debug.sh ~/datasets/tandt/truck 200
+   **5.4 实验参数组合（按需复制）**
+   ```bash
+   # === 通道粒度实验 (Channel-wise) ===
+   # DC单独量化
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qdc_ch dc 30000 channel
+
+   # 高频单独量化
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_ch rest 30000 channel
+
+   # === 通道分组实验 (Channel grouping) ===
+   # 高频分组（不同组大小）
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g3 rest 30000 group 3
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g5 rest 30000 group 5
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g9 rest 30000 group 9
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g15 rest 30000 group 15
+
+   # === 高斯球分组实验 (Gaussian grouping, 空间分组) ===
+   # 高频分组（不同高斯球组大小）
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg128 rest 30000 gaussian_group 15 128
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg256 rest 30000 gaussian_group 15 256
+   bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg512 rest 30000 gaussian_group 15 512
+
+   # === 实验性配置（已注释，需要时取消注释） ===
+   # 更细粒度的高斯球分组
+   # bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_gg64 rest 30000 gaussian_group 15 64
+
+   # DC和高频都使用gaussian_group
+   # bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_gg256 all 30000 gaussian_group 15 256
+   ```
+
+   **5.5 评估单个模型**
+   ```bash
+   # 训练完成后评估
+   bash scripts/run_eval.sh truck_base
+   bash scripts/run_eval.sh truck_qrest_ch
+
+   # 查看评估结果
+   cat artifacts/results_truck_base.json
+   cat artifacts/results_truck_qrest_ch.json
    ```
 
 **Steps**

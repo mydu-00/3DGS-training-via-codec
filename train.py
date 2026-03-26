@@ -63,7 +63,7 @@ def _qdq_channel(x: torch.Tensor) -> torch.Tensor:
 
 
 def _qdq_group(x: torch.Tensor, group_size: int) -> torch.Tensor:
-    """Per-group symmetric int8 QDQ.
+    """Per-group symmetric int8 QDQ (channel-wise grouping).
 
     Flattens dims 1+ into a single channel dimension of size flat_C, then groups
     into chunks of group_size, each with its own scale.
@@ -96,20 +96,74 @@ def _qdq_group(x: torch.Tensor, group_size: int) -> torch.Tensor:
     return (q.to(x.dtype) * scale).reshape(orig_shape)
 
 
+def _qdq_gaussian_group(x: torch.Tensor, gaussian_group_size: int) -> torch.Tensor:
+    """Per-gaussian-group symmetric int8 QDQ.
+
+    Groups gaussians (along dim 0) into blocks of gaussian_group_size, and computes
+    one scale per group across all channels. This groups spatially close gaussians
+    together for quantization.
+
+    For _features_rest [N, 15, 3] with gaussian_group_size=256:
+    - Creates N//256 groups, each with 256 gaussians
+    - Each group has one scale for all 45 channel dimensions
+
+    For _features_dc [N, 1, 3] with gaussian_group_size=256:
+    - Creates N//256 groups, each with 256 gaussians
+    - Each group has one scale for all 3 channel dimensions
+
+    Args:
+        x: Input tensor [N, K, C] where N = num gaussians
+        gaussian_group_size: Number of gaussians per group (e.g., 256)
+
+    Returns:
+        Quantized and dequantized tensor with same shape as input.
+    """
+    orig_shape = x.shape
+    N = x.shape[0]
+
+    # Flatten all channels into a single dimension
+    flat = x.reshape(N, -1)  # [N, flat_C]
+    flat_C = flat.shape[1]
+
+    # Determine effective group size
+    ggs = min(gaussian_group_size, N)  # Can't group more than N gaussians
+    if N % ggs != 0:
+        # Find largest divisor of N that is <= gaussian_group_size
+        divisors = [d for d in range(1, min(ggs, N) + 1) if N % d == 0]
+        ggs = divisors[-1]
+
+    G = N // ggs  # Number of groups
+    # Reshape to [G, ggs, flat_C] - each group contains ggs gaussians
+    grouped = flat.reshape(G, ggs, flat_C)
+
+    # Compute scale per group (across both gaussians and channels in that group)
+    # Shape: [G, 1, 1]
+    max_abs = grouped.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-12)
+    scale = max_abs / 127.0
+
+    # Quantize and dequantize
+    q = torch.clamp(torch.round(grouped / scale), -127, 127).to(torch.int8)
+    return (q.to(x.dtype) * scale).reshape(orig_shape)
+
+
 def _quant_dequant_int8_inplace(
     param: torch.nn.Parameter,
     granularity: str = "tensor",
     group_size: int = 15,
+    gaussian_group_size: int = 256,
 ) -> None:
     """Apply symmetric int8 QDQ to a parameter tensor in-place.
 
     Args:
-        param:       The parameter to quantize (modified in-place).
-        granularity: ``'tensor'`` – one global scale (original behaviour);
-                     ``'channel'`` – one scale per (SH-order, colour) position;
-                     ``'group'``   – one scale per block of *group_size* flat
-                                    channel elements.
-        group_size:  Block size for ``'group'`` mode.  Ignored otherwise.
+        param:              The parameter to quantize (modified in-place).
+        granularity:        ``'tensor'`` – one global scale (original behaviour);
+                            ``'channel'`` – one scale per (SH-order, colour) position;
+                            ``'group'``   – one scale per block of *group_size* flat
+                                           channel elements;
+                            ``'gaussian_group'`` – one scale per block of *gaussian_group_size*
+                                                  gaussians (spatial grouping).
+        group_size:         Block size for ``'group'`` mode.  Ignored otherwise.
+        gaussian_group_size: Block size for ``'gaussian_group'`` mode. Ignored otherwise.
     """
     with torch.no_grad():
         if param.data.abs().max() <= 0:
@@ -119,6 +173,8 @@ def _quant_dequant_int8_inplace(
             param.data.copy_(_qdq_channel(x))
         elif granularity == "group":
             param.data.copy_(_qdq_group(x, group_size))
+        elif granularity == "gaussian_group":
+            param.data.copy_(_qdq_gaussian_group(x, gaussian_group_size))
         else:  # "tensor" – default, backward-compatible
             param.data.copy_(_qdq_tensor(x))
 
@@ -128,25 +184,28 @@ def _apply_sh_int8_quantization(
     mode: str,
     granularity: str = "tensor",
     group_size: int = 15,
+    gaussian_group_size: int = 256,
 ) -> None:
     """Apply SH int8 quantization to the Gaussian model.
 
     Args:
-        gaussians:   The Gaussian model whose SH features are quantized.
-        mode:        Which SH components to quantize: ``'none'``, ``'dc'``,
-                     ``'rest'``, or ``'all'``.
-        granularity: Quantization granularity (``'tensor'`` / ``'channel'`` /
-                     ``'group'``).  See :func:`_quant_dequant_int8_inplace`.
-        group_size:  Group size for ``'group'`` granularity.
+        gaussians:          The Gaussian model whose SH features are quantized.
+        mode:               Which SH components to quantize: ``'none'``, ``'dc'``,
+                            ``'rest'``, or ``'all'``.
+        granularity:        Quantization granularity (``'tensor'`` / ``'channel'`` /
+                            ``'group'`` / ``'gaussian_group'``).
+                            See :func:`_quant_dequant_int8_inplace`.
+        group_size:         Group size for ``'group'`` granularity (channel-wise).
+        gaussian_group_size: Group size for ``'gaussian_group'`` granularity (spatial).
     """
     if mode == "none":
         return
     if mode in ("all", "dc"):
-        _quant_dequant_int8_inplace(gaussians._features_dc, granularity, group_size)
+        _quant_dequant_int8_inplace(gaussians._features_dc, granularity, group_size, gaussian_group_size)
     if mode in ("all", "rest"):
-        _quant_dequant_int8_inplace(gaussians._features_rest, granularity, group_size)
+        _quant_dequant_int8_inplace(gaussians._features_rest, granularity, group_size, gaussian_group_size)
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_int8_quantization, *, quant_granularity="tensor", quant_group_size=15):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, sh_int8_quantization, *, quant_granularity="tensor", quant_group_size=15, quant_gaussian_group_size=256):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -286,11 +345,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if use_sparse_adam:
                     visible = radii > 0
                     gaussians.optimizer.step(visible, radii.shape[0])
-                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization, quant_granularity, quant_group_size)
+                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization, quant_granularity, quant_group_size, quant_gaussian_group_size)
                     gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
                     gaussians.optimizer.step()
-                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization, quant_granularity, quant_group_size)
+                    _apply_sh_int8_quantization(gaussians, sh_int8_quantization, quant_granularity, quant_group_size, quant_gaussian_group_size)
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
             if (iteration in checkpoint_iterations):
@@ -376,24 +435,36 @@ if __name__ == "__main__":
     parser.add_argument('--sh_int8_quantization', type=str, choices=["none", "dc", "rest", "all"], default="none")
     parser.add_argument(
         '--quant_granularity', type=str,
-        choices=["tensor", "channel", "group"], default="tensor",
+        choices=["tensor", "channel", "group", "gaussian_group"], default="tensor",
         help=(
             "SH int8 quantization granularity. "
             "'tensor': one global scale per tensor (original behaviour, default). "
             "'channel': one scale per (SH-order, colour) position across all Gaussians "
             "(45 scales for rest, 3 for dc). "
             "'group': one scale per block of --quant_group_size flat-channel elements "
-            "(e.g. group_size=15 gives 3 groups for rest's 45 dims)."
+            "(e.g. group_size=15 gives 3 groups for rest's 45 dims). "
+            "'gaussian_group': one scale per block of --quant_gaussian_group_size gaussians "
+            "(spatial grouping, e.g. 256 gaussians per group)."
         ),
     )
     parser.add_argument(
         '--quant_group_size', type=int, default=15,
         help=(
-            "Group size for --quant_granularity=group. "
+            "Group size for --quant_granularity=group (channel-wise grouping). "
             "Must ideally divide the flat channel count (45 for SH-rest, 3 for dc). "
             "Divisors of 45: 1, 3, 5, 9, 15, 45. "
             "If not a divisor, the largest divisor <= this value is used automatically. "
             "Default 15 gives 3 groups (one per RGB channel across all SH orders)."
+        ),
+    )
+    parser.add_argument(
+        '--quant_gaussian_group_size', type=int, default=256,
+        help=(
+            "Group size for --quant_granularity=gaussian_group (spatial grouping). "
+            "Number of gaussians per quantization group. "
+            "Each group of gaussians shares one scale across all their SH coefficients. "
+            "Useful for grouping spatially close gaussians. "
+            "Default 256. Common values: 128, 256, 512, 1024."
         ),
     )
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -410,7 +481,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_int8_quantization, quant_granularity=args.quant_granularity, quant_group_size=args.quant_group_size)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.sh_int8_quantization, quant_granularity=args.quant_granularity, quant_group_size=args.quant_group_size, quant_gaussian_group_size=args.quant_gaussian_group_size)
 
     # All done
     print("\nTraining complete.")
