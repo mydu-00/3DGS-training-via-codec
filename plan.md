@@ -129,8 +129,23 @@
    # 示例6: 全部量化（DC+高频），使用channel粒度
    bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_ch all 30000 channel
 
-   # C) 完整实验套件（baseline + 量化rest + 量化all）
+   # C) 完整实验套件（自动运行所有配置并生成汇总结果）
    bash scripts/run_suite.sh ~/datasets/tandt/truck truck 30000
+
+   # 新版run_suite.sh包含以下10组实验（共20步：训练+评估）：
+   # 1. baseline                    - 无量化基准
+   # 2. rest_channel                - 高频SH + channel粒度
+   # 3. rest_group_3                - 高频SH + group粒度(size=3)
+   # 4. rest_group_9                - 高频SH + group粒度(size=9)
+   # 5. rest_group_15               - 高频SH + group粒度(size=15)
+   # 6. all_channel                 - 全部SH + channel粒度
+   # 7. all_group_3                 - 全部SH + group粒度(size=3)
+   # 8. all_group_9                 - 全部SH + group粒度(size=9)
+   # 9. all_group_15                - 全部SH + group粒度(size=15)
+   # 10. all_gaussian_group_256     - 全部SH + gaussian_group粒度(256个高斯球/组)
+
+   # 实验完成后，结果自动汇总到 artifacts/summary_truck.csv
+   # CSV包含列：run_name, variant, quant_mode, granularity, group_param, SSIM, PSNR, LPIPS, note
 
    # D) 查看结果
    ls -lah artifacts
@@ -177,6 +192,45 @@
    cat artifacts/results_truck_base.json
    cat artifacts/results_truck_qrest_ch.json
    ```
+
+   **5.6 完整实验套件说明 (run_suite.sh)**
+
+   `run_suite.sh` 脚本自动运行完整的量化实验对比套件，包含10组实验配置：
+
+   ```bash
+   # 运行完整实验套件
+   bash scripts/run_suite.sh ~/datasets/tandt/truck truck 30000
+   ```
+
+   **实验组配置详情：**
+
+   | 编号 | 变体名称 | 量化模式 | 粒度 | 参数 | 说明 |
+   |------|----------|----------|------|------|------|
+   | 1 | baseline | none | tensor | - | 无量化基准（用于对比） |
+   | 2 | rest_channel | rest | channel | - | 高频SH，每个(SH-order,颜色)独立scale |
+   | 3 | rest_group_3 | rest | group | 3 | 高频SH，通道分组size=3 (45÷3=15组) |
+   | 4 | rest_group_9 | rest | group | 9 | 高频SH，通道分组size=9 (45÷9=5组) |
+   | 5 | rest_group_15 | rest | group | 15 | 高频SH，通道分组size=15 (45÷15=3组) |
+   | 6 | all_channel | all | channel | - | DC+高频，每个(SH-order,颜色)独立scale |
+   | 7 | all_group_3 | all | group | 3 | DC+高频，通道分组size=3 |
+   | 8 | all_group_9 | all | group | 9 | DC+高频，通道分组size=9 |
+   | 9 | all_group_15 | all | group | 15 | DC+高频，通道分组size=15 |
+   | 10 | all_gaussian_group_256 | all | gaussian_group | 256 | DC+高频，每256个高斯球共享一个scale |
+
+   **输出结果：**
+   - 训练日志：`logs/train_<run_name>.log`
+   - 评估日志：`logs/eval_<run_name>.log`
+   - 评估指标：`artifacts/results_<run_name>.json`
+   - 汇总CSV：`artifacts/summary_truck.csv`
+
+   **汇总CSV格式：**
+   ```
+   run_name, variant, quant_mode, granularity, group_param, SSIM, PSNR, LPIPS, note
+   ```
+
+   **预计运行时间：** 约 10 × 30k迭代 × (训练时间/30k) + 评估时间
+   - 建议在tmux会话中运行，避免断连
+   - 可以先用200迭代测试：`bash scripts/run_suite.sh ~/datasets/tandt/truck truck_test 200`
 
 **Steps**
 1. Phase 1 - 先验证硬约束与最小可用链路
