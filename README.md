@@ -203,8 +203,58 @@ python train.py -s <path to COLMAP or NeRF Synthetic dataset>
   Influence of SSIM on total loss from 0 to 1, ```0.2``` by default. 
   #### --percent_dense
   Percentage of scene extent (0--1) a point must exceed to be forcibly densified, ```0.01``` by default.
+  #### --sh_int8_quantization
+  Apply symmetric int8 quantize-dequantize to SH parameters after each optimizer step. Choices: ```none``` (default), ```dc``` (DC component only), ```rest``` (higher-order SH only), ```all``` (both DC and rest).
+  #### --quant_granularity
+  Granularity for ```--sh_int8_quantization```. Choices: ```tensor``` (one global scale per tensor, default / original behaviour), ```channel``` (one scale per (SH-order, colour) position across all Gaussians – 45 scales for rest, 3 for dc), ```group``` (one scale per block of ```--quant_group_size``` flat channel elements).
+  #### --quant_group_size
+  Group size used when ```--quant_granularity group```. For SH-rest (45 dims) the natural divisors are 1, 3, 5, 9, 15, 45. Default is ```15``` (3 groups of 15, one per RGB channel across all SH orders). For DC (3 dims) any value ≥ 3 falls back to a single group (equivalent to per-tensor).
 
 </details>
+<br>
+
+### SH Quantization Examples
+
+The scripts below use `scripts/run_train.sh`. Usage:
+```
+bash scripts/run_train.sh <scene_path> <run_name> [quant_mode] [iters] [quant_granularity] [quant_group_size]
+```
+
+**Baseline – no quantization (original behaviour)**
+```shell
+bash scripts/run_train.sh ~/datasets/tandt/truck truck_base none 30000
+```
+
+**rest – per-channel quantization (45 independent scales for SH-rest)**
+```shell
+bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_ch rest 30000 channel
+```
+
+**rest – per-group quantization, group_size=9 (5 groups of 9 for 45-dim rest)**
+```shell
+bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g9 rest 30000 group 9
+```
+
+**rest – per-group quantization, group_size=15 (3 groups of 15, one per RGB)**
+```shell
+bash scripts/run_train.sh ~/datasets/tandt/truck truck_qrest_g15 rest 30000 group 15
+```
+
+**all – per-group quantization (rest=45 dims, dc=3 dims)**
+```shell
+bash scripts/run_train.sh ~/datasets/tandt/truck truck_qall_g15 all 30000 group 15
+```
+
+Or invoke `train.py` directly:
+```shell
+python train.py -s ~/datasets/tandt/truck -m output/truck_qrest_ch \
+  --eval --iterations 30000 --disable_viewer \
+  --sh_int8_quantization rest --quant_granularity channel
+
+python train.py -s ~/datasets/tandt/truck -m output/truck_qrest_g9 \
+  --eval --iterations 30000 --disable_viewer \
+  --sh_int8_quantization rest --quant_granularity group --quant_group_size 9
+```
 <br>
 
 Note that similar to MipNeRF360, we target images at resolutions in the 1-1.6K pixel range. For convenience, arbitrary-size inputs can be passed and will be automatically resized if their width exceeds 1600 pixels. We recommend to keep this behavior, but you may force training to use your higher-resolution images by setting ```-r 1```.
