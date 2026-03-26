@@ -128,7 +128,57 @@
 
 ---
 
-## 同步 GitHub 远程更新到已有 HTTPS-Clone 的服务器仓库
+## Per-Gaussian Channel QDQ: Bug Fix & Incremental Experiment
+
+### Bug fixed (channel quantization)
+
+The previous `channel` granularity in `train.py` computed one scale per (SH-order, colour) position **shared across all Gaussians** (reducing over dim=0 / the N dimension).  This is incorrect: different Gaussians can have very different SH coefficient magnitudes, so sharing a single global scale leads to unnecessary quantization error.
+
+**Fix**: `_qdq_channel` now reduces over the SH-order dimension (dim=1), yielding one scale per Gaussian per colour channel.  For `_features_rest [N, 15, 3]` this produces N×3 independent scales instead of 45 global ones.
+
+### Incremental experiment: only `rest` and `all` with per-gaussian channel QDQ
+
+The new script `scripts/run_incremental_channel_pg.sh` runs exactly two new variants and appends results to new artifact files – existing artifacts from the baseline/tensor experiments are **not touched**.
+
+#### Quick commands (copy-paste)
+
+```bash
+# Short debug verification (200 iter) with the fixed channel granularity:
+bash scripts/run_debug.sh ~/datasets/tandt/truck 200 rest channel
+bash scripts/run_debug.sh ~/datasets/tandt/truck 200 all  channel
+
+# Full incremental experiment (rest + all, 30k, per-gaussian channel):
+bash scripts/run_incremental_channel_pg.sh ~/datasets/tandt/truck truck 30000
+
+# Results land in:
+#   artifacts/results_truck_qrest_ch_pg.json
+#   artifacts/results_truck_qall_ch_pg.json
+#   artifacts/summary_truck_ch_pg.csv
+```
+
+#### Manually calling `train.py` directly
+
+```bash
+# rest, per-gaussian channel QDQ
+python train.py -s ~/datasets/tandt/truck -m output/truck_qrest_ch_pg \
+  --eval --iterations 30000 --disable_viewer \
+  --sh_int8_quantization rest --quant_granularity channel
+
+# all, per-gaussian channel QDQ
+python train.py -s ~/datasets/tandt/truck -m output/truck_qall_ch_pg \
+  --eval --iterations 30000 --disable_viewer \
+  --sh_int8_quantization all --quant_granularity channel
+```
+
+#### Pulling latest code on the remote server
+
+```bash
+cd ~/work/3dgs_codec_exp
+git fetch origin
+git pull --rebase origin main   # or the PR branch name
+```
+
+
 
 服务器上通过 HTTPS clone 后，每次本地 push 新代码到 GitHub，在服务器上执行以下操作将远程改动同步下来。
 
